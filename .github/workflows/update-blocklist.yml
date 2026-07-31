@@ -1,0 +1,37 @@
+name: Update Blocklist
+
+on:
+  schedule:
+    - cron: '0 20 * * *' # 每天凌晨 04:00 (台灣時間) 自動執行 (UTC 20:00)
+  workflow_dispatch: # 允許在網頁上手動點擊執行
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允許機器人修改 Release 頁面
+
+    steps:
+      - name: 📥 下載原始碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🔨 抓取清單並編譯 blocklist.bin
+        run: |
+          # 這裡設定了兩大最強清單：StevenBlack (綜合) + OISD Big (超強廣告過濾)
+          # build_blocklist.py 會自動過濾掉 ABP 語法，只抽出純網域並雜湊打包
+          python3 tools/build_blocklist.py blocklist.bin "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" "https://big.oisd.nl/domainswild"
+
+      - name: 🚀 發布到 GitHub Releases (固定網址)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 刪除舊的 latest 發布版本 (如果有的話)
+          gh release delete latest --cleanup-tag -y || true
+          
+          # 建立新的 latest 版本，並把剛剛編譯好的 blocklist.bin 傳上去
+          gh release create latest blocklist.bin --title "🌟 最新擋廣告清單 (Daily Update)" --notes "機器人自動更新於：$(date -u '+%Y-%m-%d %H:%M UTC')"
