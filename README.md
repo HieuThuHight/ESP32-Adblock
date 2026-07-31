@@ -1,4 +1,4 @@
-# esp32-c3-adblock (Now with ESP32-S3 PSRAM Turbo!)
+# ESP AdBlock (ESP32-S3 / C3 DNS Sinkhole)
 
 A **Pi-hole-style DNS ad-blocker** that runs on a **$2 ESP32-C3** (no PSRAM required) — OR a **$5 ESP32-S3** (with PSRAM) for enterprise-grade RAM caching!
 
@@ -63,19 +63,19 @@ pio run -e s3 -t upload
 pio run -e s3 -t uploadfs
 
 # 4. watch it boot, note the IP / open the dashboard
-pio device monitor          # -> http://c3adblock.local
+pio device monitor          # -> http://espadblock.local
 ```
 
 ### WiFi setup (no re-flash needed)
 
 If it can't connect (or you never set `secrets.h`), it starts an open access point
-**`C3-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
-type the password, done. To move it to a new network later: open `http://c3adblock.local/forgetwifi`,
+**`ESP-AdBlock-XXXX`** with a captive portal — join it from a phone, pick your network,
+type the password, done. To move it to a new network later: open `http://espadblock.local/forgetwifi`,
 or hold the **BOOT** button while powering on, and the setup portal comes back.
 
 ## Over-the-air updates (no more USB)
 
-The dashboard at **http://c3adblock.local** does it all:
+The dashboard at **http://espadblock.local** does it all:
 
 - **Blocklist** — drop a freshly built `blocklist.bin` into *Blocklist → Upload*, or set a
   URL under *Remote auto-update* and the device pulls a prebuilt `blocklist.bin`

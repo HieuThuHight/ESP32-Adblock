@@ -1,6 +1,6 @@
-// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+// ESP AdBlock — DNS sinkhole + web dashboard for the ESP32.
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
-// Dashboard at http://c3adblock.local : per-client stats, system info,
+// Dashboard at http://espadblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
 
 #include <Arduino.h>
@@ -378,7 +378,7 @@ static void startConfigPortal() {
   portalOpts = "";
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + jesc(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
+  char ap[24]; snprintf(ap, sizeof(ap), "ESP-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
@@ -393,7 +393,7 @@ static void startConfigPortal() {
 
 void setup() {
   Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting");
+  Serial.println("\n[esp-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -429,7 +429,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
+  if (MDNS.begin("espadblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://espadblock.local"); }
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
@@ -448,7 +448,7 @@ void setup() {
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.setHostname("espadblock");   // pio run -t upload --upload-port espadblock.local
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
