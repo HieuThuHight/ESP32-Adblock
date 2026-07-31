@@ -10,3 +10,10 @@ src/secrets.h
 
 # Backups / scratch
 *.bak
+
+# Cache and IDE files (Python, Clangd, etc.)
+.cache/
+__pycache__/
+*.pyc
+.clangd
+compile_commands.json
