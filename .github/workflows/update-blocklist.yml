@@ -2,7 +2,7 @@ name: Update Blocklist
 
 on:
   schedule:
-    - cron: '0 20 * * *' # 每天凌晨 04:00 (台灣時間) 自動執行 (UTC 20:00)
+    - cron: '0 20 */3 * *' # 每 3 天的凌晨 04:00 (台灣時間) 自動執行 (UTC 20:00)
   workflow_dispatch: # 允許在網頁上手動點擊執行
 
 jobs:
