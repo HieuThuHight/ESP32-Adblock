@@ -1,0 +1,46 @@
+name: Build Firmware
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'platformio.ini'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch: # 允許在網頁上手動點擊執行
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 允許機器人修改 Release 頁面
+
+    steps:
+      - name: 📥 下載原始碼
+        uses: actions/checkout@v4
+
+      - name: 🐍 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🛠️ 安裝 PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: 🔨 雲端編譯 C++ 韌體 (S3)
+        run: |
+          # 執行 PlatformIO 編譯指令 (指定 s3 環境)
+          pio run -e s3
+
+      - name: 🚀 發布 Firmware 到 GitHub Releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 刪除舊的 firmware-latest 發布版本 (如果有的話)
+          gh release delete firmware-latest --cleanup-tag -y || true
+          
+          # 建立新的 firmware-latest 版本，並上傳編譯好的 firmware.bin
+          gh release create firmware-latest .pio/build/s3/firmware.bin \
+            --title "🔥 最新系統韌體 (S3 Firmware)" \
+            --notes "機器人自動編譯於：$(date -u '+%Y-%m-%d %H:%M UTC')。下載此檔案後可直接透過網頁儀表板 OTA 升級！"
