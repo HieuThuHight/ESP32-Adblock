@@ -31,7 +31,7 @@ jobs:
       - name: 🔨 雲端編譯 C++ 韌體 (S3)
         run: |
           # 執行 PlatformIO 編譯指令 (指定 s3 環境)
-          pio run -e s3
+          python -m platformio run -e s3
 
       - name: 🚀 發布 Firmware 到 GitHub Releases
         env:
