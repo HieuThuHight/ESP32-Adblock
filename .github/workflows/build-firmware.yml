@@ -18,6 +18,9 @@ jobs:
       - name: 📥 下載原始碼
         uses: actions/checkout@v4
 
+      - name: 🔐 準備編譯設定檔
+        run: cp src/secrets.example.h src/secrets.h
+
       - name: 🐍 設定 Python 環境
         uses: actions/setup-python@v5
         with:
