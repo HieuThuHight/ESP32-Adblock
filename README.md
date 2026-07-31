@@ -107,9 +107,9 @@ dig @<device-ip> github.com        # -> real IP  (forwarded)
 
 ## Credits
 
-Inspired by [s60sc/ESP32_AdBlocker](https://github.com/s60sc/ESP32_AdBlocker) — the
-"answer 0.0.0.0 for blocklisted domains" idea. This is an independent from-scratch
-implementation focused on the hash-in-flash optimization for PSRAM-less chips, now supercharged for S3.
+This project is an upgraded fork of the excellent [M-Abozaid/esp32-c3-adblock](https://github.com/M-Abozaid/esp32-c3-adblock). We added ESP32-S3 PSRAM caching, ABP filter syntax support, and automated GitHub Actions builds.
+
+The original work was inspired by [s60sc/ESP32_AdBlocker](https://github.com/s60sc/ESP32_AdBlocker) — the "answer 0.0.0.0 for blocklisted domains" idea, with an independent from-scratch implementation by M-Abozaid focused on the hash-in-flash optimization.
 
 ## License
 
