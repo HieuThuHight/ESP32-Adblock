@@ -46,7 +46,7 @@ static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
 
 // remote blocklist auto-update
-String updateUrl = "https://github.com/WL107/ESP32-Adblock/releases/download/latest/blocklist.bin";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
+String updateUrl = "https://github.com/HieuThuHight/ESP32-Adblock/releases/download/latest/blocklist.bin";              // URL of a prebuilt blocklist.bin (e.g. GitHub release asset)
 uint32_t updateIntervalH = 72;      // hours between auto-fetches (72 = 3 days)
 uint32_t lastCheckMs = 0;
 String updateStatus = "never";
