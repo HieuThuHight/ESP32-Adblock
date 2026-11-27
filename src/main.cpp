@@ -214,59 +214,303 @@ static void handleBan() {
   web.send(200, "text/plain", "ok");
 }
 
+
 // ---------- blocklist swap (shared by upload + remote fetch) ----------
-// The partition holds one list, so we free the old one before writing the new.
-// While swapping, numHashes=0 -> device fail-opens (forwards, no blocking).
-static void reopenBlocklist() {
-  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
-  numHashes = blocklist ? blocklist.size() / HASH_BYTES : 0;
+
+static const char* BLOCKLIST_NEW_PATH = "/blocklist.new";
+static const char* BLOCKLIST_BAK_PATH = "/blocklist.bak";
+
+// Read a 5-byte little-endian hash.
+static uint64_t readHash40(const uint8_t* p) {
+  uint64_t h = 0;
+  for (int i = 0; i < HASH_BYTES; i++) {
+    h |= (uint64_t)p[i] << (8 * i);
+  }
+  return h;
 }
-static void beginBlocklistSwap() {
+
+// Validate file size and strictly increasing hash order.
+static bool validateBlocklist(const char* path) {
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  size_t sz = f.size();
+
+  if (sz == 0 || sz % HASH_BYTES != 0) {
+    f.close();
+    return false;
+  }
+
+  uint8_t buffer[1020]; // 1020 is divisible by 5
+  size_t remaining = sz;
+  uint64_t previous = 0;
+  bool hasPrevious = false;
+  bool valid = true;
+
+  while (remaining > 0) {
+    size_t chunk = remaining;
+    if (chunk > sizeof(buffer)) chunk = sizeof(buffer);
+
+    int n = f.read(buffer, chunk);
+    if (n != (int)chunk) {
+      valid = false;
+      break;
+    }
+
+    for (size_t i = 0; i < chunk; i += HASH_BYTES) {
+      uint64_t current = readHash40(buffer + i);
+
+      if (hasPrevious && current <= previous) {
+        valid = false;
+        break;
+      }
+
+      previous = current;
+      hasPrevious = true;
+    }
+
+    if (!valid) break;
+
+    remaining -= chunk;
+    yield();
+  }
+
+  f.close();
+  return valid && remaining == 0;
+}
+
+// Reopen the active blocklist and rebuild its PSRAM cache.
+static bool reopenBlocklist() {
   if (blocklist) blocklist.close();
+
+  if (psramCache) {
+    free(psramCache);
+    psramCache = nullptr;
+  }
+
   numHashes = 0;
-  LittleFS.remove(BLOCKLIST_PATH);
-  LittleFS.remove("/blocklist.new");
+  blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+
+  if (!blocklist) return false;
+
+  size_t sz = blocklist.size();
+
+  if (sz == 0 || sz % HASH_BYTES != 0) {
+    blocklist.close();
+    return false;
+  }
+
+  numHashes = sz / HASH_BYTES;
+
+  if (psramFound()) {
+    psramCache = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+
+    if (psramCache) {
+      size_t bytesRead = 0;
+
+      while (bytesRead < sz) {
+        size_t chunk = sz - bytesRead;
+        if (chunk > 4096) chunk = 4096;
+
+        int n = blocklist.read(psramCache + bytesRead, chunk);
+        if (n <= 0) break;
+
+        bytesRead += n;
+        yield();
+      }
+
+      if (bytesRead != sz) {
+        Serial.println("[blocklist] PSRAM cache incomplete");
+        free(psramCache);
+        psramCache = nullptr;
+        blocklist.seek(0);
+      } else {
+        Serial.printf("[blocklist] PSRAM loaded: %u bytes\n",
+                      (unsigned)bytesRead);
+      }
+    }
+  }
+
+  return true;
 }
-static bool commitNewBlocklist() {                  // /blocklist.new -> live (validated)
-  File f = LittleFS.open("/blocklist.new", "r");
-  size_t sz = f ? f.size() : 0; if (f) f.close();
-  bool ok = sz > 0 && (sz % HASH_BYTES) == 0;       // sorted hash blob -> 5-byte multiple
-  if (ok) LittleFS.rename("/blocklist.new", BLOCKLIST_PATH);
-  else    LittleFS.remove("/blocklist.new");
-  reopenBlocklist();
-  return ok;
+
+// Recover an interrupted replacement after a reboot.
+static void recoverBlocklistFiles() {
+  bool liveExists = LittleFS.exists(BLOCKLIST_PATH);
+  bool backupExists = LittleFS.exists(BLOCKLIST_BAK_PATH);
+
+  if (!liveExists && backupExists) {
+    if (LittleFS.rename(BLOCKLIST_BAK_PATH, BLOCKLIST_PATH)) {
+      Serial.println("[blocklist] Previous blocklist restored");
+    } else {
+      Serial.println("[blocklist] WARNING: backup restore failed");
+    }
+  } else if (liveExists && backupExists) {
+    LittleFS.remove(BLOCKLIST_BAK_PATH);
+  }
+}
+
+// Prepare a temporary file without touching the active blocklist.
+static void beginBlocklistSwap() {
+  if (LittleFS.exists(BLOCKLIST_NEW_PATH)) {
+    LittleFS.remove(BLOCKLIST_NEW_PATH);
+  }
+}
+
+// Validate and atomically replace the active blocklist with backup recovery.
+static bool commitNewBlocklist() {
+  if (!validateBlocklist(BLOCKLIST_NEW_PATH)) {
+    Serial.println("[blocklist] New file validation failed");
+    LittleFS.remove(BLOCKLIST_NEW_PATH);
+    return false;
+  }
+
+  // Remove an old backup before starting a new transaction.
+  if (LittleFS.exists(BLOCKLIST_BAK_PATH)) {
+    if (!LittleFS.remove(BLOCKLIST_BAK_PATH)) {
+      Serial.println("[blocklist] Cannot remove old backup");
+      return false;
+    }
+  }
+
+  bool hadLive = LittleFS.exists(BLOCKLIST_PATH);
+
+  // Close active file before renaming it.
+  if (blocklist) blocklist.close();
+
+  // Keep the old blocklist as a backup.
+  if (hadLive && !LittleFS.rename(BLOCKLIST_PATH, BLOCKLIST_BAK_PATH)) {
+    Serial.println("[blocklist] Cannot create backup");
+    reopenBlocklist();
+    return false;
+  }
+
+  // Move the validated new file into the active location.
+  if (!LittleFS.rename(BLOCKLIST_NEW_PATH, BLOCKLIST_PATH)) {
+    Serial.println("[blocklist] New file rename failed");
+
+    if (hadLive) {
+      LittleFS.rename(BLOCKLIST_BAK_PATH, BLOCKLIST_PATH);
+    }
+
+    reopenBlocklist();
+    return false;
+  }
+
+  // Reopen the new file and rebuild its cache.
+  if (!reopenBlocklist()) {
+    Serial.println("[blocklist] Cannot reopen new file");
+
+    LittleFS.remove(BLOCKLIST_PATH);
+
+    if (hadLive) {
+      LittleFS.rename(BLOCKLIST_BAK_PATH, BLOCKLIST_PATH);
+    }
+
+    reopenBlocklist();
+    return false;
+  }
+
+  // New blocklist is active. Remove the old backup.
+  if (hadLive) {
+    LittleFS.remove(BLOCKLIST_BAK_PATH);
+  }
+
+  Serial.printf("[blocklist] Update successful: %u hashes\n",
+                (unsigned)numHashes);
+
+  return true;
 }
 
 // ---------- OTA blocklist update (browser upload) ----------
+
 static bool upOk = false;
+static bool upWriteOk = true;
 static File upFile;
+
 static void handleUploadDone() {
-  web.send(upOk ? 200 : 500, "text/plain",
-           upOk ? "ok" : "rejected: empty or size not a multiple of 5 (not a blocklist.bin?)");
+  web.send(
+    upOk ? 200 : 500,
+    "text/plain",
+    upOk ? "ok" : "rejected: upload incomplete or invalid blocklist"
+  );
 }
+
 static void handleUpload() {
   HTTPUpload& u = web.upload();
+
   switch (u.status) {
-    case UPLOAD_FILE_START:
-      upOk = false; beginBlocklistSwap();
-      upFile = LittleFS.open("/blocklist.new", "w");
-      Serial.printf("[ota] receiving %s\n", u.filename.c_str());
+    case UPLOAD_FILE_START: {
+      upOk = false;
+      upWriteOk = true;
+
+      beginBlocklistSwap();
+
+      upFile = LittleFS.open(BLOCKLIST_NEW_PATH, "w");
+
+      if (!upFile) {
+        upWriteOk = false;
+        Serial.println("[upload] Cannot create temporary file");
+      }
+
+      Serial.printf("[upload] receiving %s\n", u.filename.c_str());
       break;
-    case UPLOAD_FILE_WRITE:
-      if (upFile) upFile.write(u.buf, u.currentSize);
+    }
+
+    case UPLOAD_FILE_WRITE: {
+      if (!upFile || !upWriteOk) {
+        upWriteOk = false;
+        break;
+      }
+
+      size_t written = upFile.write(u.buf, u.currentSize);
+
+      if (written != u.currentSize) {
+        upWriteOk = false;
+        Serial.println("[upload] Write failed");
+      }
+
       break;
-    case UPLOAD_FILE_END:
-      if (upFile) upFile.close();
-      upOk = commitNewBlocklist();
-      Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", numHashes);
+    }
+
+    case UPLOAD_FILE_END: {
+      if (upFile) {
+        upFile.flush();
+        upFile.close();
+      }
+
+      if (upWriteOk) {
+        upOk = commitNewBlocklist();
+      } else {
+        LittleFS.remove(BLOCKLIST_NEW_PATH);
+        upOk = false;
+      }
+
+      Serial.printf(
+        "[upload] %s -> %u domains\n",
+        upOk ? "OK" : "REJECTED",
+        (unsigned)numHashes
+      );
+
       break;
-    case UPLOAD_FILE_ABORTED:
-      if (upFile) upFile.close();
-      LittleFS.remove("/blocklist.new"); reopenBlocklist();
-      Serial.println("[ota] aborted");
+    }
+
+    case UPLOAD_FILE_ABORTED: {
+      if (upFile) {
+        upFile.close();
+      }
+
+      LittleFS.remove(BLOCKLIST_NEW_PATH);
+
+      upOk = false;
+      upWriteOk = false;
+
+      Serial.println("[upload] Aborted; old blocklist preserved");
       break;
+    }
   }
 }
+
 
 // ---------- remote blocklist auto-update ----------
 static void loadUpdateCfg() {
@@ -279,33 +523,145 @@ static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
+
 static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
-  Serial.printf("[remote] GET %s\n", url.c_str());
-  WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
-  WiFiClient cl;
-  HTTPClient http; http.setTimeout(20000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
-  beginBlocklistSwap();
-  File f = LittleFS.open("/blocklist.new", "w");
-  if (!f) { http.end(); updateStatus = "fs open failed"; reopenBlocklist(); return false; }
-  WiFiClient* stream = http.getStreamPtr();
-  int len = http.getSize(); uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
-  while (http.connected() && (len < 0 || (int)total < len)) {
-    size_t avail = stream->available();
-    if (avail) { int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail); if (n > 0) { f.write(b, n); total += n; idle = millis(); } }
-    else { if (millis() - idle > 15000) break; delay(2); }
+  url.trim();
+
+  if (!url.length()) {
+    updateStatus = "no url set";
+    return false;
   }
-  f.close(); http.end();
+
+  Serial.printf("[remote] GET %s\n", url.c_str());
+
+  WiFiClientSecure cs;
+  cs.setInsecure();
+
+  WiFiClient cl;
+  HTTPClient http;
+
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  bool https = url.startsWith("https://");
+
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) {
+    updateStatus = "begin failed";
+    return false;
+  }
+
+  int code = http.GET();
+
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    updateStatus = "HTTP " + String(code);
+    Serial.printf("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
+
+  beginBlocklistSwap();
+
+  File f = LittleFS.open(BLOCKLIST_NEW_PATH, "w");
+
+  if (!f) {
+    http.end();
+    updateStatus = "fs open failed";
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+
+  int contentLength = http.getSize();
+  uint8_t buffer[1024];
+
+  size_t total = 0;
+  bool writeOk = true;
+  bool timedOut = false;
+
+  uint32_t lastDataTime = millis();
+
+  while (true) {
+    size_t availableBytes = stream->available();
+
+    if (availableBytes > 0) {
+      size_t chunk = availableBytes;
+
+      if (chunk > sizeof(buffer)) {
+        chunk = sizeof(buffer);
+      }
+
+      int received = stream->readBytes(buffer, chunk);
+
+      if (received <= 0) {
+        writeOk = false;
+        break;
+      }
+
+      size_t written = f.write(buffer, received);
+
+      if (written != (size_t)received) {
+        writeOk = false;
+        break;
+      }
+
+      total += written;
+      lastDataTime = millis();
+
+      if (contentLength >= 0 &&
+          total > (size_t)contentLength) {
+        writeOk = false;
+        break;
+      }
+    } else {
+      if (!http.connected()) {
+        break;
+      }
+
+      if (millis() - lastDataTime > 20000) {
+        timedOut = true;
+        break;
+      }
+
+      delay(2);
+    }
+
+    yield();
+  }
+
+  f.flush();
+  f.close();
+  http.end();
+
+  bool complete = writeOk && !timedOut && total > 0;
+
+  if (contentLength >= 0 &&
+      total != (size_t)contentLength) {
+    complete = false;
+  }
+
+  if (!complete) {
+    LittleFS.remove(BLOCKLIST_NEW_PATH);
+
+    updateStatus = "download incomplete (" +
+                   String(total) + " bytes)";
+
+    Serial.printf("[remote] %s\n", updateStatus.c_str());
+    return false;
+  }
+
   bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+
+  if (ok) {
+    updateStatus = "ok: " + String(numHashes) + " domains";
+  } else {
+    updateStatus = "blocklist validation or commit failed";
+  }
+
   Serial.printf("[remote] %s\n", updateStatus.c_str());
+
   return ok;
 }
+
 
 // ---------- firmware OTA (browser upload of firmware.bin -> reboot) ----------
 static void handleFwUpdateDone() {
@@ -391,67 +747,151 @@ static void startConfigPortal() {
   while (true) { dnsPortal.processNextRequest(); web.handleClient(); delay(2); }
 }
 
+
 void setup() {
-  Serial.begin(115200); delay(300);
+  Serial.begin(115200);
+  delay(300);
   Serial.println("\n[esp-adblock] booting");
-  if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
+
+  // Mount LittleFS without automatic formatting.
+  if (!LittleFS.begin(false)) {
+    Serial.println("[ERROR] LittleFS mount failed!");
+    return;
+  }
+
+    // Recover an interrupted blocklist update.
+  recoverBlocklistFiles();
+
+  // Load blocklist.
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
+
   if (blocklist) {
     size_t sz = blocklist.size();
-    numHashes = sz / HASH_BYTES;
-    Serial.printf("blocklist: %u domains\n", numHashes);
-    if (psramFound()) {
-      psramCache = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
-      if (psramCache) {
-        size_t bytesRead = 0;
-        while (bytesRead < sz) {
-          size_t chunk = sz - bytesRead;
-          if (chunk > 4096) chunk = 4096;
-          int r = blocklist.read(psramCache + bytesRead, chunk);
-          if (r <= 0) break;
-          bytesRead += r;
-          yield();
+
+    if (sz == 0 || sz % HASH_BYTES != 0) {
+      Serial.println("[ERROR] Invalid blocklist size!");
+      blocklist.close();
+      numHashes = 0;
+    } else {
+      numHashes = sz / HASH_BYTES;
+      Serial.printf("blocklist: %u domains\n", (unsigned)numHashes);
+
+      // Load blocklist into PSRAM when available.
+      if (psramFound()) {
+        psramCache = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+
+        if (psramCache) {
+          size_t bytesRead = 0;
+
+          while (bytesRead < sz) {
+            size_t chunk = sz - bytesRead;
+            if (chunk > 4096) chunk = 4096;
+
+            int r = blocklist.read(psramCache + bytesRead, chunk);
+            if (r <= 0) break;
+
+            bytesRead += r;
+            yield();
+          }
+
+          if (bytesRead != sz) {
+            Serial.println("[ERROR] PSRAM cache incomplete!");
+            free(psramCache);
+            psramCache = nullptr;
+            blocklist.seek(0);
+          } else {
+            Serial.printf("PSRAM cache loaded: %u bytes\n", (unsigned)bytesRead);
+          }
+        } else {
+          Serial.println("PSRAM alloc failed, fallback to Flash");
         }
-        Serial.printf("PSRAM cache loaded: %u bytes\n", bytesRead);
-      } else {
-        Serial.println("PSRAM alloc failed, fallback to Flash");
       }
     }
+  } else {
+    numHashes = 0;
+    Serial.println("[WARN] No blocklist found!");
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
+
+  loadCustom();
+  loadBanned();
+  loadUpdateCfg();
+
   Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
 
-  // Hold BOOT (GPIO9) at power-on to wipe saved WiFi and force the setup portal.
+  // Hold BOOT (GPIO9) at power-on to wipe saved WiFi.
   pinMode(9, INPUT_PULLUP);
-  if (digitalRead(9) == LOW) { delay(60);
-    if (digitalRead(9) == LOW) { prefs.begin("wifi", false); prefs.clear(); prefs.end();
-      Serial.println("[setup] BOOT held -> cleared saved WiFi"); } }
 
-  if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
+  if (digitalRead(9) == LOW) {
+    delay(60);
+
+    if (digitalRead(9) == LOW) {
+      prefs.begin("wifi", false);
+      prefs.clear();
+      prefs.end();
+      Serial.println("[setup] BOOT held -> cleared saved WiFi");
+    }
+  }
+
+  if (!connectWiFi()) startConfigPortal();
+
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("espadblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://espadblock.local"); }
 
-  dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
+  if (MDNS.begin("espadblock")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("dashboard: http://espadblock.local");
+  }
+
+  dnsServer.begin(DNS_PORT);
+  upstreamCli.begin(0);
+
   web.on("/", []() { web.send_P(200, "text/html", PAGE); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/forgetwifi", []() { web.send(200, "text/plain", "cleared — rebooting into setup portal");
-    prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
-  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA
-  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA
-  web.on("/fetchnow", []() { fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
+  web.on("/addblock", []() {
+    addCustom(web.arg("d"));
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/unblock", []() {
+    removeCustom(web.arg("d"));
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/forgetwifi", []() {
+    web.send(200, "text/plain", "cleared — rebooting into setup portal");
+    prefs.begin("wifi", false);
+    prefs.clear();
+    prefs.end();
+    delay(500);
+    ESP.restart();
+  });
+
+  web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);
+  web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);
+
+  web.on("/fetchnow", []() {
+    fetchBlocklist(updateUrl);
+    web.send(200, "text/plain", updateStatus);
+  });
+
   web.on("/setupdate", []() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
-    if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
-    saveUpdateCfg(); web.send(200, "text/plain", "ok");
+
+    if (web.hasArg("h")) {
+      updateIntervalH = web.arg("h").toInt();
+      if (updateIntervalH < 1) updateIntervalH = 1;
+    }
+
+    saveUpdateCfg();
+    web.send(200, "text/plain", "ok");
   });
+
   web.begin();
-  ArduinoOTA.setHostname("espadblock");   // pio run -t upload --upload-port espadblock.local
+
+  ArduinoOTA.setHostname("espadblock");
   ArduinoOTA.begin();
+
   Serial.println("DNS :53 + dashboard :80 + OTA up");
 }
+
 
 void loop() {
   ArduinoOTA.handle();
