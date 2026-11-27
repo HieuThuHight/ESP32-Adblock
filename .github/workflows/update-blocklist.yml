@@ -1,37 +1,66 @@
-name: Update Blocklist
+
+name: Update ESP32 Blocklist
 
 on:
   schedule:
-    - cron: '0 20 */3 * *' # 每 3 天的凌晨 04:00 (台灣時間) 自動執行 (UTC 20:00)
-  workflow_dispatch: # 允許在網頁上手動點擊執行
+    - cron: "0 20 */3 * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-blocklist
+  cancel-in-progress: false
 
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # 允許機器人修改 Release 頁面
+    timeout-minutes: 20
 
     steps:
-      - name: 📥 下載原始碼
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: 🐍 設定 Python 環境
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
-      - name: 🔨 抓取清單並編譯 blocklist.bin
+      - name: Build blocklist.bin
         run: |
-          # 這裡設定了兩大最強清單：StevenBlack (綜合) + OISD Big (超強廣告過濾)
-          # build_blocklist.py 會自動過濾掉 ABP 語法，只抽出純網域並雜湊打包
-          python3 tools/build_blocklist.py blocklist.bin "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" "https://big.oisd.nl/domainswild"
+          python tools/build_blocklist.py blocklist.bin
 
-      - name: 🚀 發布到 GitHub Releases (固定網址)
+      - name: Validate binary
+        run: |
+          test -s blocklist.bin
+
+          SIZE=$(stat -c%s blocklist.bin)
+
+          if [ $((SIZE % 5)) -ne 0 ]; then
+            echo "Invalid blocklist size: not divisible by 5"
+            exit 1
+          fi
+
+          echo "Blocklist size: $SIZE bytes"
+          sha256sum blocklist.bin
+
+      - name: Publish GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 刪除舊的 latest 發布版本 (如果有的話)
-          gh release delete latest --cleanup-tag -y || true
-          
-          # 建立新的 latest 版本，並把剛剛編譯好的 blocklist.bin 傳上去
-          gh release create latest blocklist.bin --title "🌟 最新擋廣告清單 (Daily Update)" --notes "機器人自動更新於：$(date -u '+%Y-%m-%d %H:%M UTC')"
+          NOTES="Automatically generated ESP32 blocklist."
+          NOTES="$NOTES\nSources: HaGeZi Multi Pro + TIF Medium."
+          NOTES="$NOTES\nUpdated: $(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest blocklist.bin --clobber
+            gh release edit latest \
+              --title "ESP32 AdBlock - Latest Blocklist" \
+              --notes "$NOTES"
+          else
+            gh release create latest blocklist.bin \
+              --title "ESP32 AdBlock - Latest Blocklist" \
+              --notes "$NOTES"
+          fi
